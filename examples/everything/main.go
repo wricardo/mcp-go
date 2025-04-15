@@ -29,12 +29,38 @@ const (
 )
 
 func NewMCPServer() *server.MCPServer {
+
+	hooks := &server.Hooks{}
+
+	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
+		fmt.Printf("beforeAny: %s, %v, %v\n", method, id, message)
+	})
+	hooks.AddOnSuccess(func(ctx context.Context, id any, method mcp.MCPMethod, message any, result any) {
+		fmt.Printf("onSuccess: %s, %v, %v, %v\n", method, id, message, result)
+	})
+	hooks.AddOnError(func(ctx context.Context, id any, method mcp.MCPMethod, message any, err error) {
+		fmt.Printf("onError: %s, %v, %v, %v\n", method, id, message, err)
+	})
+	hooks.AddBeforeInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest) {
+		fmt.Printf("beforeInitialize: %v, %v\n", id, message)
+	})
+	hooks.AddAfterInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest, result *mcp.InitializeResult) {
+		fmt.Printf("afterInitialize: %v, %v, %v\n", id, message, result)
+	})
+	hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result *mcp.CallToolResult) {
+		fmt.Printf("afterCallTool: %v, %v, %v\n", id, message, result)
+	})
+	hooks.AddBeforeCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest) {
+		fmt.Printf("beforeCallTool: %v, %v\n", id, message)
+	})
+
 	mcpServer := server.NewMCPServer(
 		"example-servers/everything",
 		"1.0.0",
 		server.WithResourceCapabilities(true, true),
 		server.WithPromptCapabilities(true),
 		server.WithLogging(),
+		server.WithHooks(hooks),
 	)
 
 	mcpServer.AddResource(mcp.NewResource("test://static/resource",
@@ -173,14 +199,12 @@ func runUpdateInterval() {
 func handleReadResource(
 	ctx context.Context,
 	request mcp.ReadResourceRequest,
-) ([]interface{}, error) {
-	return []interface{}{
+) ([]mcp.ResourceContents, error) {
+	return []mcp.ResourceContents{
 		mcp.TextResourceContents{
-			ResourceContents: mcp.ResourceContents{
-				URI:      "test://static/resource",
-				MIMEType: "text/plain",
-			},
-			Text: "This is a sample resource",
+			URI:      "test://static/resource",
+			MIMEType: "text/plain",
+			Text:     "This is a sample resource",
 		},
 	}, nil
 }
@@ -188,14 +212,12 @@ func handleReadResource(
 func handleResourceTemplate(
 	ctx context.Context,
 	request mcp.ReadResourceRequest,
-) ([]interface{}, error) {
-	return []interface{}{
+) ([]mcp.ResourceContents, error) {
+	return []mcp.ResourceContents{
 		mcp.TextResourceContents{
-			ResourceContents: mcp.ResourceContents{
-				URI:      request.Params.URI,
-				MIMEType: "text/plain",
-			},
-			Text: "This is a sample resource",
+			URI:      request.Params.URI,
+			MIMEType: "text/plain",
+			Text:     "This is a sample resource",
 		},
 	}, nil
 }
@@ -304,6 +326,7 @@ func handleSendNotification(
 	server := server.ServerFromContext(ctx)
 
 	err := server.SendNotificationToClient(
+		ctx,
 		"notifications/progress",
 		map[string]interface{}{
 			"progress":      10,
@@ -325,10 +348,6 @@ func handleSendNotification(
 	}, nil
 }
 
-func ServeSSE(mcpServer *server.MCPServer, addr string) *server.SSEServer {
-	return server.NewSSEServer(mcpServer, fmt.Sprintf("http://%s", addr))
-}
-
 func handleLongRunningOperationTool(
 	ctx context.Context,
 	request mcp.CallToolRequest,
@@ -344,6 +363,7 @@ func handleLongRunningOperationTool(
 		time.Sleep(time.Duration(stepDuration * float64(time.Second)))
 		if progressToken != nil {
 			server.SendNotificationToClient(
+				ctx,
 				"notifications/progress",
 				map[string]interface{}{
 					"progress":      i,
@@ -422,19 +442,14 @@ func handleNotification(
 func main() {
 	var transport string
 	flag.StringVar(&transport, "t", "stdio", "Transport type (stdio or sse)")
-	flag.StringVar(
-		&transport,
-		"transport",
-		"stdio",
-		"Transport type (stdio or sse)",
-	)
+	flag.StringVar(&transport, "transport", "stdio", "Transport type (stdio or sse)")
 	flag.Parse()
 
 	mcpServer := NewMCPServer()
 
 	// Only check for "sse" since stdio is the default
 	if transport == "sse" {
-		sseServer := ServeSSE(mcpServer, "localhost:8080")
+		sseServer := server.NewSSEServer(mcpServer, server.WithBaseURL("http://localhost:8080"))
 		log.Printf("SSE server listening on :8080")
 		if err := sseServer.Start(":8080"); err != nil {
 			log.Fatalf("Server error: %v", err)

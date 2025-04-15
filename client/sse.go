@@ -35,23 +35,39 @@ type SSEMCPClient struct {
 	notifyMu      sync.RWMutex
 	endpointChan  chan struct{}
 	capabilities  mcp.ServerCapabilities
+	headers       map[string]string
+}
+
+type ClientOption func(*SSEMCPClient)
+
+func WithHeaders(headers map[string]string) ClientOption {
+	return func(sc *SSEMCPClient) {
+		sc.headers = headers
+	}
 }
 
 // NewSSEMCPClient creates a new SSE-based MCP client with the given base URL.
 // Returns an error if the URL is invalid.
-func NewSSEMCPClient(baseURL string) (*SSEMCPClient, error) {
+func NewSSEMCPClient(baseURL string, options ...ClientOption) (*SSEMCPClient, error) {
 	parsedURL, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 
-	return &SSEMCPClient{
+	smc := &SSEMCPClient{
 		baseURL:      parsedURL,
 		httpClient:   &http.Client{},
 		responses:    make(map[int64]chan RPCResponse),
 		done:         make(chan struct{}),
 		endpointChan: make(chan struct{}),
-	}, nil
+		headers:      make(map[string]string),
+	}
+
+	for _, opt := range options {
+		opt(smc)
+	}
+
+	return smc, nil
 }
 
 // Start initiates the SSE connection to the server and waits for the endpoint information.
@@ -69,6 +85,9 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Connection", "keep-alive")
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -101,35 +120,49 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 func (c *SSEMCPClient) readSSE(reader io.ReadCloser) {
 	defer reader.Close()
 
-	scanner := bufio.NewScanner(reader)
+	br := bufio.NewReader(reader)
 	var event, data string
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if line == "" {
-			// Empty line means end of event
-			if event != "" && data != "" {
-				c.handleSSEEvent(event, data)
-				event = ""
-				data = ""
-			}
-			continue
-		}
-
-		if strings.HasPrefix(line, "event:") {
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		} else if strings.HasPrefix(line, "data:") {
-			data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
+	for {
 		select {
 		case <-c.done:
 			return
 		default:
-			fmt.Printf("SSE stream error: %v\n", err)
+			line, err := br.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					// Process any pending event before exit
+					if event != "" && data != "" {
+						c.handleSSEEvent(event, data)
+					}
+					break
+				}
+				select {
+				case <-c.done:
+					return
+				default:
+					fmt.Printf("SSE stream error: %v\n", err)
+					return
+				}
+			}
+
+			// Remove only newline markers
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				// Empty line means end of event
+				if event != "" && data != "" {
+					c.handleSSEEvent(event, data)
+					event = ""
+					data = ""
+				}
+				continue
+			}
+
+			if strings.HasPrefix(line, "event:") {
+				event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			} else if strings.HasPrefix(line, "data:") {
+				data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			}
 		}
 	}
 }
@@ -260,6 +293,10 @@ func (c *SSEMCPClient) sendRequest(
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	// set custom http headers
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -354,7 +391,7 @@ func (c *SSEMCPClient) Initialize(
 			err,
 		)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 
 	c.initialized = true
 	return &result, nil
@@ -365,42 +402,77 @@ func (c *SSEMCPClient) Ping(ctx context.Context) error {
 	return err
 }
 
+// ListResourcesByPage manually list resources by page.
+func (c *SSEMCPClient) ListResourcesByPage(
+	ctx context.Context,
+	request mcp.ListResourcesRequest,
+) (*mcp.ListResourcesResult, error) {
+	result, err := listByPage[mcp.ListResourcesResult](ctx, c, request.PaginatedRequest, "resources/list")
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (c *SSEMCPClient) ListResources(
 	ctx context.Context,
 	request mcp.ListResourcesRequest,
 ) (*mcp.ListResourcesResult, error) {
-	response, err := c.sendRequest(ctx, "resources/list", request.Params)
+	result, err := c.ListResourcesByPage(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
-	var result mcp.ListResourcesResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListResourcesByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.Resources = append(result.Resources, newPageRes.Resources...)
+			result.NextCursor = newPageRes.NextCursor
+		}
 	}
+	return result, nil
+}
 
-	return &result, nil
+func (c *SSEMCPClient) ListResourceTemplatesByPage(
+	ctx context.Context,
+	request mcp.ListResourceTemplatesRequest,
+) (*mcp.ListResourceTemplatesResult, error) {
+	result, err := listByPage[mcp.ListResourceTemplatesResult](ctx, c, request.PaginatedRequest, "resources/templates/list")
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (c *SSEMCPClient) ListResourceTemplates(
 	ctx context.Context,
 	request mcp.ListResourceTemplatesRequest,
 ) (*mcp.ListResourceTemplatesResult, error) {
-	response, err := c.sendRequest(
-		ctx,
-		"resources/templates/list",
-		request.Params,
-	)
+	result, err := c.ListResourceTemplatesByPage(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
-	var result mcp.ListResourceTemplatesResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListResourceTemplatesByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.ResourceTemplates = append(result.ResourceTemplates, newPageRes.ResourceTemplates...)
+			result.NextCursor = newPageRes.NextCursor
+		}
 	}
-
-	return &result, nil
+	return result, nil
 }
 
 func (c *SSEMCPClient) ReadResource(
@@ -412,12 +484,7 @@ func (c *SSEMCPClient) ReadResource(
 		return nil, err
 	}
 
-	var result mcp.ReadResourceResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return &result, nil
+	return mcp.ParseReadResourceResult(response)
 }
 
 func (c *SSEMCPClient) Subscribe(
@@ -436,21 +503,40 @@ func (c *SSEMCPClient) Unsubscribe(
 	return err
 }
 
+func (c *SSEMCPClient) ListPromptsByPage(
+	ctx context.Context,
+	request mcp.ListPromptsRequest,
+) (*mcp.ListPromptsResult, error) {
+	result, err := listByPage[mcp.ListPromptsResult](ctx, c, request.PaginatedRequest, "prompts/list")
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (c *SSEMCPClient) ListPrompts(
 	ctx context.Context,
 	request mcp.ListPromptsRequest,
 ) (*mcp.ListPromptsResult, error) {
-	response, err := c.sendRequest(ctx, "prompts/list", request.Params)
+	result, err := c.ListPromptsByPage(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
-	var result mcp.ListPromptsResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListPromptsByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.Prompts = append(result.Prompts, newPageRes.Prompts...)
+			result.NextCursor = newPageRes.NextCursor
+		}
 	}
-
-	return &result, nil
+	return result, nil
 }
 
 func (c *SSEMCPClient) GetPrompt(
@@ -465,21 +551,40 @@ func (c *SSEMCPClient) GetPrompt(
 	return mcp.ParseGetPromptResult(response)
 }
 
+func (c *SSEMCPClient) ListToolsByPage(
+	ctx context.Context,
+	request mcp.ListToolsRequest,
+) (*mcp.ListToolsResult, error) {
+	result, err := listByPage[mcp.ListToolsResult](ctx, c, request.PaginatedRequest, "tools/list")
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (c *SSEMCPClient) ListTools(
 	ctx context.Context,
 	request mcp.ListToolsRequest,
 ) (*mcp.ListToolsResult, error) {
-	response, err := c.sendRequest(ctx, "tools/list", request.Params)
+	result, err := c.ListToolsByPage(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
-	var result mcp.ListToolsResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListToolsByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.Tools = append(result.Tools, newPageRes.Tools...)
+			result.NextCursor = newPageRes.NextCursor
+		}
 	}
-
-	return &result, nil
+	return result, nil
 }
 
 func (c *SSEMCPClient) CallTool(

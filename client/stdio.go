@@ -23,6 +23,7 @@ type StdioMCPClient struct {
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
 	stdout        *bufio.Reader
+	stderr        io.ReadCloser
 	requestID     atomic.Int64
 	responses     map[int64]chan RPCResponse
 	mu            sync.RWMutex
@@ -58,9 +59,15 @@ func NewStdioMCPClient(
 		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
 	client := &StdioMCPClient{
 		cmd:       cmd,
 		stdin:     stdin,
+		stderr:    stderr,
 		stdout:    bufio.NewReader(stdout),
 		responses: make(map[int64]chan RPCResponse),
 		done:      make(chan struct{}),
@@ -88,7 +95,16 @@ func (c *StdioMCPClient) Close() error {
 	if err := c.stdin.Close(); err != nil {
 		return fmt.Errorf("failed to close stdin: %w", err)
 	}
+	if err := c.stderr.Close(); err != nil {
+		return fmt.Errorf("failed to close stderr: %w", err)
+	}
 	return c.cmd.Wait()
+}
+
+// Stderr returns a reader for the stderr output of the subprocess.
+// This can be used to capture error messages or logs from the subprocess.
+func (c *StdioMCPClient) Stderr() io.Reader {
+	return c.stderr
 }
 
 // OnNotification registers a handler function to be called when notifications are received.
@@ -284,48 +300,77 @@ func (c *StdioMCPClient) Initialize(
 	return &result, nil
 }
 
-func (c *StdioMCPClient) ListResources(
+// ListResourcesByPage manually list resources by page.
+func (c *StdioMCPClient) ListResourcesByPage(
 	ctx context.Context,
 	request mcp.ListResourcesRequest,
-) (*mcp.
-	ListResourcesResult, error) {
-	response, err := c.sendRequest(
-		ctx,
-		"resources/list",
-		request.Params,
-	)
+) (*mcp.ListResourcesResult, error) {
+	result, err := listByPage[mcp.ListResourcesResult](ctx, c, request.PaginatedRequest, "resources/list")
 	if err != nil {
 		return nil, err
 	}
+	return result, nil
+}
 
-	var result mcp.ListResourcesResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+func (c *StdioMCPClient) ListResources(
+	ctx context.Context,
+	request mcp.ListResourcesRequest,
+) (*mcp.ListResourcesResult, error) {
+	result, err := c.ListResourcesByPage(ctx, request)
+	if err != nil {
+		return nil, err
 	}
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListResourcesByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.Resources = append(result.Resources, newPageRes.Resources...)
+			result.NextCursor = newPageRes.NextCursor
+		}
+	}
+	return result, nil
+}
 
-	return &result, nil
+func (c *StdioMCPClient) ListResourceTemplatesByPage(
+	ctx context.Context,
+	request mcp.ListResourceTemplatesRequest,
+) (*mcp.ListResourceTemplatesResult, error) {
+	result, err := listByPage[mcp.ListResourceTemplatesResult](ctx, c, request.PaginatedRequest, "resources/templates/list")
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (c *StdioMCPClient) ListResourceTemplates(
 	ctx context.Context,
 	request mcp.ListResourceTemplatesRequest,
-) (*mcp.
-	ListResourceTemplatesResult, error) {
-	response, err := c.sendRequest(
-		ctx,
-		"resources/templates/list",
-		request.Params,
-	)
+) (*mcp.ListResourceTemplatesResult, error) {
+	result, err := c.ListResourceTemplatesByPage(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
-	var result mcp.ListResourceTemplatesResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListResourceTemplatesByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.ResourceTemplates = append(result.ResourceTemplates, newPageRes.ResourceTemplates...)
+			result.NextCursor = newPageRes.NextCursor
+		}
 	}
-
-	return &result, nil
+	return result, nil
 }
 
 func (c *StdioMCPClient) ReadResource(
@@ -338,12 +383,7 @@ func (c *StdioMCPClient) ReadResource(
 		return nil, err
 	}
 
-	var result mcp.ReadResourceResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return &result, nil
+	return mcp.ParseReadResourceResult(response)
 }
 
 func (c *StdioMCPClient) Subscribe(
@@ -362,21 +402,40 @@ func (c *StdioMCPClient) Unsubscribe(
 	return err
 }
 
+func (c *StdioMCPClient) ListPromptsByPage(
+	ctx context.Context,
+	request mcp.ListPromptsRequest,
+) (*mcp.ListPromptsResult, error) {
+	result, err := listByPage[mcp.ListPromptsResult](ctx, c, request.PaginatedRequest, "prompts/list")
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (c *StdioMCPClient) ListPrompts(
 	ctx context.Context,
 	request mcp.ListPromptsRequest,
 ) (*mcp.ListPromptsResult, error) {
-	response, err := c.sendRequest(ctx, "prompts/list", request.Params)
+	result, err := c.ListPromptsByPage(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
-	var result mcp.ListPromptsResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListPromptsByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.Prompts = append(result.Prompts, newPageRes.Prompts...)
+			result.NextCursor = newPageRes.NextCursor
+		}
 	}
-
-	return &result, nil
+	return result, nil
 }
 
 func (c *StdioMCPClient) GetPrompt(
@@ -391,21 +450,40 @@ func (c *StdioMCPClient) GetPrompt(
 	return mcp.ParseGetPromptResult(response)
 }
 
+func (c *StdioMCPClient) ListToolsByPage(
+	ctx context.Context,
+	request mcp.ListToolsRequest,
+) (*mcp.ListToolsResult, error) {
+	result, err := listByPage[mcp.ListToolsResult](ctx, c, request.PaginatedRequest, "tools/list")
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (c *StdioMCPClient) ListTools(
 	ctx context.Context,
 	request mcp.ListToolsRequest,
 ) (*mcp.ListToolsResult, error) {
-	response, err := c.sendRequest(ctx, "tools/list", request.Params)
+	result, err := c.ListToolsByPage(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-
-	var result mcp.ListToolsResult
-	if err := json.Unmarshal(*response, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	for result.NextCursor != "" {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			request.Params.Cursor = result.NextCursor
+			newPageRes, err := c.ListToolsByPage(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			result.Tools = append(result.Tools, newPageRes.Tools...)
+			result.NextCursor = newPageRes.NextCursor
+		}
 	}
-
-	return &result, nil
+	return result, nil
 }
 
 func (c *StdioMCPClient) CallTool(

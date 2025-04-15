@@ -8,6 +8,14 @@
 
 <strong>A Go implementation of the Model Context Protocol (MCP), enabling seamless integration between LLM applications and external data sources and tools.</strong>
 
+<br>
+
+[![Tutorial](http://img.youtube.com/vi/qoaeYMrXJH0/0.jpg)](http://www.youtube.com/watch?v=qoaeYMrXJH0 "Tutorial")
+
+<br>
+
+Discuss the SDK on [Discord](https://discord.gg/RqSS2NQVsY)
+
 </div>
 
 ```go
@@ -15,6 +23,7 @@ package main
 
 import (
     "context"
+    "errors"
     "fmt"
 
     "github.com/mark3labs/mcp-go/mcp"
@@ -49,7 +58,7 @@ func main() {
 func helloHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
     name, ok := request.Params.Arguments["name"].(string)
     if !ok {
-        return mcp.NewToolResultError("name must be a string"), nil
+        return nil, errors.New("name must be a string")
     }
 
     return mcp.NewToolResultText(fmt.Sprintf("Hello, %s!", name)), nil
@@ -103,6 +112,7 @@ package main
 
 import (
     "context"
+    "errors"
     "fmt"
 
     "github.com/mark3labs/mcp-go/mcp"
@@ -116,6 +126,7 @@ func main() {
         "1.0.0",
         server.WithResourceCapabilities(true, true),
         server.WithLogging(),
+        server.WithRecovery(),
     )
 
     // Add a calculator tool
@@ -152,7 +163,7 @@ func main() {
             result = x * y
         case "divide":
             if y == 0 {
-                return mcp.NewToolResultError("Cannot divide by zero"), nil
+                return nil, errors.New("Cannot divide by zero")
             }
             result = x / y
         }
@@ -219,23 +230,20 @@ resource := mcp.NewResource(
     "Project README",
     mcp.WithResourceDescription("The project's README file"), 
     mcp.WithMIMEType("text/markdown"),
-    mcp.WithAnnotations([]mcp.Role{mcp.RoleAssistant}, 0.8),
 )
 
 // Add resource with its handler
-s.AddResource(resource, func(ctx context.Context, request mcp.ReadResourceRequest) ([]interface{}, error) {
+s.AddResource(resource, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
     content, err := os.ReadFile("README.md")
     if err != nil {
         return nil, err
     }
     
-    return []interface{}{
+    return []mcp.ResourceContents{
         mcp.TextResourceContents{
-            ResourceContents: mcp.ResourceContents{
-                URI:      "docs://readme",
-                MIMEType: "text/markdown",
-            },
-            Text: string(content),
+            URI:      "docs://readme",
+            MIMEType: "text/markdown",
+            Text:     string(content),
         },
     }, nil
 })
@@ -250,31 +258,30 @@ template := mcp.NewResourceTemplate(
     "User Profile",
     mcp.WithTemplateDescription("Returns user profile information"),
     mcp.WithTemplateMIMEType("application/json"),
-    mcp.WithTemplateAnnotations([]mcp.Role{mcp.RoleAssistant, mcp.RoleUser}, 0.5),
 )
 
 // Add template with its handler
-s.AddResourceTemplate(template, func(ctx context.Context, request mcp.ReadResourceRequest) ([]interface{}, error) {
-    userID := request.Params.URI // Extract ID from the full URI
+s.AddResourceTemplate(template, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+    // Extract ID from the URI using regex matching
+    // The server automatically matches URIs to templates
+    userID := extractIDFromURI(request.Params.URI)
     
     profile, err := getUserProfile(userID)  // Your DB/API call here
     if err != nil {
         return nil, err
     }
     
-    return []interface{}{
+    return []mcp.ResourceContents{
         mcp.TextResourceContents{
-            ResourceContents: mcp.ResourceContents{
-                URI:      fmt.Sprintf("users://%s/profile", userID),
-                MIMEType: "application/json",
-            },
-            Text: profile,
+            URI:      request.Params.URI,
+            MIMEType: "application/json",
+            Text:     profile,
         },
     }, nil
 })
 ```
 
-The examples are simple but demonstrate the core concepts. Resources can be much more sophisticated - serving multiple contents, using annotations, integrating with databases or external APIs, etc.
+The examples are simple but demonstrate the core concepts. Resources can be much more sophisticated - serving multiple contents, integrating with databases or external APIs, etc.
 </details>
 
 ### Tools
@@ -318,7 +325,7 @@ s.AddTool(calculatorTool, func(ctx context.Context, request mcp.CallToolRequest)
         result = x * y
     case "divide":
         if y == 0 {
-            return mcp.NewToolResultError("Division by zero is not allowed"), nil
+            return nil, errors.New("Division by zero is not allowed")
         }
         result = x / y
     }
@@ -363,20 +370,20 @@ s.AddTool(httpTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp
         req, err = http.NewRequest(method, url, nil)
     }
     if err != nil {
-        return mcp.NewToolResultError(fmt.Sprintf("Failed to create request: %v", err)), nil
+        return nil, fmt.Errorf("Failed to create request: %v", err)
     }
 
     client := &http.Client{}
     resp, err := client.Do(req)
     if err != nil {
-        return mcp.NewToolResultError(fmt.Sprintf("Request failed: %v", err)), nil
+        return nil, fmt.Errorf("Request failed: %v", err)
     }
     defer resp.Body.Close()
 
     // Return response
     respBody, err := io.ReadAll(resp.Body)
     if err != nil {
-        return mcp.NewToolResultError(fmt.Sprintf("Failed to read response: %v", err)), nil
+        return nil, fmt.Errorf("Failed to read response: %v", err)
     }
 
     return mcp.NewToolResultText(fmt.Sprintf("Status: %d\nBody: %s", resp.StatusCode, string(respBody))), nil
@@ -414,7 +421,7 @@ s.AddPrompt(mcp.NewPrompt("greeting",
         mcp.ArgumentDescription("Name of the person to greet"),
     ),
 ), func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-    name := request.Params.Arguments["name"].(string)
+    name := request.Params.Arguments["name"]
     if name == "" {
         name = "friend"
     }
@@ -438,7 +445,7 @@ s.AddPrompt(mcp.NewPrompt("code_review",
         mcp.RequiredArgument(),
     ),
 ), func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-    prNumber := request.Params.Arguments["pr_number"].(string)
+    prNumber := request.Params.Arguments["pr_number"]
     if prNumber == "" {
         return nil, fmt.Errorf("pr_number is required")
     }
@@ -469,7 +476,7 @@ s.AddPrompt(mcp.NewPrompt("query_builder",
         mcp.RequiredArgument(),
     ),
 ), func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-    tableName := request.Params.Arguments["table"].(string)
+    tableName := request.Params.Arguments["table"]
     if tableName == "" {
         return nil, fmt.Errorf("table name is required")
     }
@@ -507,6 +514,24 @@ Prompts can include:
 
 For examples, see the `examples/` directory.
 
+## Extras
+
+### Request Hooks
+
+Hook into the request lifecycle by creating a `Hooks` object with your
+selection among the possible callbacks.  This enables telemetry across all
+functionality, and observability of various facts, for example the ability
+to count improperly-formatted requests, or to log the agent identity during
+initialization.
+
+Add the `Hooks` to the server at the time of creation using the
+`server.WithHooks` option.
+
+### Tool Handler Middleware
+
+Add middleware to tool call handlers using the `server.WithToolHandlerMiddleware` option. Middlewares can be registered on server creation and are applied on every tool call.
+
+A recovery middleware option is available to recover from panics in a tool call and can be added to the server with the `server.WithRecovery` option.
 
 ## Contributing
 
